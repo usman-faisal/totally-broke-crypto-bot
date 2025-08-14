@@ -35,47 +35,37 @@ class EnhancedMomentumBot:
 
         # Configuration parameters
         self.config = {
-            'trend_tolerance': 0.02,
-            'strong_buy_threshold': 75,  # legacy (not used in new rule engine)
-            'buy_threshold': 60,         # legacy (not used in new rule engine)
-            'pullback_tolerance': 0.005,
-            'rsi_threshold_high': 75,
-            'rsi_threshold_low': 30,
-            'crossover_lookback': 5,
-            'volume_confirmation': True,
+            # --- Timeframes ---
+            'htf_timeframe': '15m',           # Higher timeframe for trend filter
 
-            # Support/Resistance parameters
-            'sr_lookback_periods': 50,        # Periods to look back for S/R (base)
-            'sr_min_touches': 2,              # Minimum touches to confirm S/R
-            'sr_proximity_threshold': 0.01,   # Base % fallback if ATR not available
-            'fibonacci_enabled': True,        # Enable Fibonacci retracements
-            'pivot_order': 5,                 # Order for scipy peak detection
-            'sr_strength_threshold': 3,       # Minimum strength for valid S/R
-            'entry_buffer': 0.002,            # 0.2% buffer above support for entry
-            'stop_loss_ratio': 0.015,         # legacy (replaced by ATR below)
+            # --- S/R Sensitivity & Precision ---
+            'sr_lookback_periods': 150,       # Longer lookback on low TFs to get enough data
+            'pivot_order': 3,                 # More sensitive to smaller price swings
+            'vol_cluster_atr_mult': 0.4,      # Tighter clustering for more precise S/R zones
+            'time_decay_lambda': 0.45,        # Heavily weigh recent touches over older ones
+            'sr_strength_threshold': 8,       # Higher threshold to filter noise from longer lookback
+            'fibonacci_enabled': False,       # Fibonacci is less reliable on very low timeframes
 
-            # === New config for enhancements ===
-            'htf_timeframe': '4h',            # higher timeframe for trend filter
-            'ema_fast': 50,
-            'ema_slow': 200,
-
+            # --- Risk Management & Entry ---
             'atr_period': 14,
-            'atr_stop_multiplier': 2.0,       # Stop = Support - ATR * multiplier
-            'min_reward_risk': 1.5,           # Minimum R:R to validate setup
+            'atr_stop_multiplier': 1.2,       # TIGHTER stop loss (critical for scalping)
+            'min_reward_risk': 1.1,           # Lower R:R is acceptable for high-frequency scalps
+            'entry_buffer': 0.0005,           # 0.05% buffer above support for entry (razor thin)
+            
+            # --- Confirmation Signal Timing ---
+            'pattern_window': 3,              # Check last 3 closed candles for patterns
+            'divergence_lookback': 40,        # Shorter lookback for recent divergences
+            'support_touch_atr_mult': 0.8,    # "near support" defined by a tighter ATR multiplier
 
-            'time_decay_lambda': 0.15,        # Exponential decay for recent touches
-            'vol_cluster_atr_mult': 1.0,      # How wide the clustering window is in ATRs
-            'confluence_multipliers': {       # Multipliers by # of agreeing methods
-                1: 1.0,
-                2: 1.25,
-                3: 1.55,
-                4: 1.85,
-                5: 2.2
+            # --- Legacy / Unused in new rules ---
+            'ema_fast': 50,                   # These EMAs are now on the 15m chart
+            'ema_slow': 200,
+            'sr_min_touches': 2,
+            'confluence_multipliers': {
+                1: 1.0, 2: 1.25, 3: 1.55, 4: 1.85, 5: 2.2
             },
-            'pattern_window': 5,              # check last N closed candles for patterns
-            'divergence_lookback': 80,        # how far back to look for divergences
-            'support_touch_atr_mult': 1.0,    # "near support" defined by ATR multiplier
         }
+
 
         self._cached_last_5m_atr = None  # used by entry calc when ATR from 5m is needed
 
@@ -690,16 +680,16 @@ class EnhancedMomentumBot:
         print(f"Trading Pair: {self.trading_pair}")
         print(f"{'='*70}")
 
-        # Fetch data
-        df_1h = self.fetch_ohlcv_data('1h', limit=400)
-        df_5m = self.fetch_ohlcv_data('5m', limit=500)
-        df_htf = self.fetch_ohlcv_data(self.config['htf_timeframe'], limit=400)
+        # Fetch data    
+        df_entry_exec = self.fetch_ohlcv_data('1m', limit=500)      # Execution chart
+        df_sr_analysis = self.fetch_ohlcv_data('5m', limit=400)     # S/R chart
+        df_htf = self.fetch_ohlcv_data(self.config['htf_timeframe'], limit=400) # HTF is now '15m'
 
-        if df_1h.empty or df_5m.empty or df_htf.empty:
-            return {"error": "Insufficient data for analysis"}
+        if df_sr_analysis.empty or df_entry_exec.empty or df_htf.empty:
+            return {"error": "Insufficient data for scalping analysis"}
 
         # Cache 5m ATR for downstream use (stop, support proximity)
-        atr_5m_series = self.calculate_atr(df_5m, self.config['atr_period'])
+        atr_5m_series = self.calculate_atr(df_sr_analysis, self.config['atr_period'])
         self._cached_last_5m_atr = float(atr_5m_series.iloc[-1]) if len(atr_5m_series) else None
 
         print("Phase 1: Higher-Timeframe Trend Filter...")
@@ -708,7 +698,7 @@ class EnhancedMomentumBot:
               f"| EMA50={htf_details.get('ema50', 'NA'):.6f} | EMA200={htf_details.get('ema200', 'NA'):.6f}")
 
         print("\nPhase 2: Calculating Support/Resistance Levels...")
-        sr_levels = self.calculate_support_resistance_levels(df_1h)
+        sr_levels = self.calculate_support_resistance_levels(df_sr_analysis)
 
         print(f"\n📊 Support Levels Found:")
         for i, support in enumerate(sr_levels['supports']):
@@ -751,14 +741,14 @@ class EnhancedMomentumBot:
 
         # Confirmations
         print("\nPhase 4: Confirmation Signals (5m)...")
-        divergence = self._detect_bullish_divergence(df_5m, entry_strategy['support_level'], self._cached_last_5m_atr)
-        pattern_ok = self._bullish_candle_confirmed(df_5m, entry_strategy['support_level'], self._cached_last_5m_atr)
+        divergence = self._detect_bullish_divergence(df_sr_analysis, entry_strategy['support_level'], self._cached_last_5m_atr)
+        pattern_ok = self._bullish_candle_confirmed(df_sr_analysis, entry_strategy['support_level'], self._cached_last_5m_atr)
         print(f"  Bullish RSI Divergence near support: {divergence}")
         print(f"  Bullish Candlestick Pattern near support: {pattern_ok}")
 
         # Momentum snapshot (kept for additional color; not required by rules)
         print("\nPhase 5: Momentum Confirmation...")
-        momentum_result = self.analyze_momentum_signals(df_5m)
+        momentum_result = self.analyze_momentum_signals(df_sr_analysis)
 
         # Rule-based final decision
         combined_signal = self._combine_sr_momentum_signals(
