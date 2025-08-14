@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Requires: pip install mplfinance
 import ccxt
 import pandas as pd
 import numpy as np
@@ -8,7 +9,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import warnings
 from scipy.signal import argrelextrema
+import matplotlib
+# Use Agg backend which is reliable for saving plots
+matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
+import mplfinance as mpf
 
 # Suppress pandas warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -43,7 +49,8 @@ class EnhancedMomentumBot:
             'pivot_order': 3,                 # More sensitive to smaller price swings
             'vol_cluster_atr_mult': 0.4,      # Tighter clustering for more precise S/R zones
             'time_decay_lambda': 0.45,        # Heavily weigh recent touches over older ones
-            'sr_strength_threshold': 8,       # Higher threshold to filter noise from longer lookback
+            'sr_strength_threshold': 3,       # Lower threshold to detect more levels
+            'sr_proximity_threshold': 0.01,   # Fallback proximity when ATR not available (1%)
             'fibonacci_enabled': False,       # Fibonacci is less reliable on very low timeframes
 
             # --- Risk Management & Entry ---
@@ -51,6 +58,7 @@ class EnhancedMomentumBot:
             'atr_stop_multiplier': 1.2,       # TIGHTER stop loss (critical for scalping)
             'min_reward_risk': 1.1,           # Lower R:R is acceptable for high-frequency scalps
             'entry_buffer': 0.0005,           # 0.05% buffer above support for entry (razor thin)
+            'stop_loss_ratio': 0.01,          # Fallback percent stop when ATR unavailable (1%)
             
             # --- Confirmation Signal Timing ---
             'pattern_window': 3,              # Check last 3 closed candles for patterns
@@ -553,13 +561,13 @@ class EnhancedMomentumBot:
     # ---------------------------
     # Bullish divergence near support
     # ---------------------------
-    def _detect_bullish_divergence(self, df: pd.DataFrame, support_level: float, recent_atr_5m: Optional[float]) -> bool:
+    def _detect_bullish_divergence(self, df: pd.DataFrame, support_level: float, recent_atr_5m: Optional[float]) -> Dict:
         """
         Price makes lower low while RSI makes higher low, near support.
         Check last N bars for two swing lows in price and compare RSI lows.
         """
         if df.empty or len(df) < 30:
-            return False
+            return {'found': False}
         lookback = min(self.config['divergence_lookback'], len(df))
         sub = df.tail(lookback).copy()
         sub['rsi'] = self.calculate_rsi(sub['close'])
@@ -567,11 +575,12 @@ class EnhancedMomentumBot:
         order = max(2, self.config['pivot_order'] // 2)
         low_idx = argrelextrema(sub['low'].values, np.less, order=order)[0]
         if len(low_idx) < 2:
-            return False
+            return {'found': False}
         # Take last two swing lows
         i1, i2 = low_idx[-2], low_idx[-1]
         p1 = float(sub['low'].iloc[i1]); p2 = float(sub['low'].iloc[i2])
         r1 = float(sub['rsi'].iloc[i1]); r2 = float(sub['rsi'].iloc[i2])
+        ts1 = sub.index[i1]; ts2 = sub.index[i2]
         price_ll = p2 < p1
         rsi_hl = r2 > r1
 
@@ -582,52 +591,30 @@ class EnhancedMomentumBot:
             # fallback: 1% window
             near = abs(p2 - support_level) / support_level <= 0.01
 
-        return bool(price_ll and rsi_hl and near)
+        if price_ll and rsi_hl and near:
+            return {
+                'found': True,
+                'price_points': ((ts1, p1), (ts2, p2)),
+                'rsi_points': ((ts1, r1), (ts2, r2))
+            }
+        return {'found': False}
 
     # ---------------------------
     # Candlestick confirmation
     # ---------------------------
-    def _bullish_candle_confirmed(self, df: pd.DataFrame, support_level: float, recent_atr_5m: Optional[float]) -> bool:
+    def _bullish_candle_confirmed(self, df: pd.DataFrame, support_level: float, recent_atr_5m: Optional[float]) -> Dict:
         """
         Confirm if a bullish reversal pattern appears near support in the last closed candles.
         Patterns: Hammer, Doji, Bullish Engulfing.
         """
         if df.empty or len(df) < 5:
-            return False
+            return {'found': False}
         window = min(self.config['pattern_window'], len(df)-1)
         slice_df = df.tail(window + 1).iloc[:-1]  # exclude the most recent forming candle
-        for ts, row in slice_df.iterrows():
-            o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
-            body = abs(c - o)
-            range_ = h - l if h > l else 0.0
-            if range_ == 0:
-                continue
 
-            # near support?
-            if recent_atr_5m and support_level > 0:
-                near = abs(c - support_level) <= self.config['support_touch_atr_mult'] * recent_atr_5m
-            else:
-                near = abs(c - support_level) / support_level <= 0.01
-
-            if not near:
-                continue
-
-            upper_wick = h - max(c, o)
-            lower_wick = min(c, o) - l
-
-            # Hammer: small body near top, long lower shadow
-            is_hammer = (lower_wick > 2 * body) and (upper_wick <= body)
-
-            # Doji: tiny body relative to range
-            is_doji = body <= 0.1 * range_
-
-            # Bullish Engulfing requires previous candle
-            # We need to access the next row (chronologically) → use rolling pairs
-        # Re-check with rolling pairs for engulfing
-        seq = slice_df.copy()
+        # Check Bullish Engulfing with rolling pairs
         prev = None
-        engulfing_found = False
-        for idx, row in seq.iterrows():
+        for idx, row in slice_df.iterrows():
             if prev is not None:
                 o1, c1 = float(prev['open']), float(prev['close'])
                 o2, c2 = float(row['open']), float(row['close'])
@@ -641,14 +628,10 @@ class EnhancedMomentumBot:
                 else:
                     near = abs(c2 - support_level) / support_level <= 0.01
                 if prev_red and curr_green and engulfs and near:
-                    engulfing_found = True
-                    break
+                    return {'found': True, 'timestamp': idx, 'pattern_type': 'Engulfing'}
             prev = row
 
         # If not engulfing, evaluate individual candles for hammer/doji
-        if engulfing_found:
-            return True
-
         for ts, row in slice_df.iterrows():
             o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
             body = abs(c - o)
@@ -663,12 +646,16 @@ class EnhancedMomentumBot:
                 continue
             upper_wick = h - max(c, o)
             lower_wick = min(c, o) - l
+            # Hammer: small body near top, long lower shadow
             is_hammer = (lower_wick > 2 * body) and (upper_wick <= body)
-            is_doji = body <= 0.1 * (h - l) if (h - l) > 0 else False
-            if is_hammer or is_doji:
-                return True
+            # Doji: tiny body relative to range
+            is_doji = body <= 0.1 * range_
+            if is_hammer:
+                return {'found': True, 'timestamp': ts, 'pattern_type': 'Hammer'}
+            if is_doji:
+                return {'found': True, 'timestamp': ts, 'pattern_type': 'Doji'}
 
-        return False
+        return {'found': False}
 
     # ---------------------------
     # Main analysis pipeline
@@ -684,6 +671,7 @@ class EnhancedMomentumBot:
         df_entry_exec = self.fetch_ohlcv_data('1m', limit=500)      # Execution chart
         df_sr_analysis = self.fetch_ohlcv_data('5m', limit=400)     # S/R chart
         df_htf = self.fetch_ohlcv_data(self.config['htf_timeframe'], limit=400) # HTF is now '15m'
+        self._last_df_sr_analysis = df_sr_analysis
 
         if df_sr_analysis.empty or df_entry_exec.empty or df_htf.empty:
             return {"error": "Insufficient data for scalping analysis"}
@@ -717,9 +705,14 @@ class EnhancedMomentumBot:
         if not entry_strategy['entry_valid']:
             return {
                 "signal": "HOLD",
+                "confidence": 0.0,
                 "reason": entry_strategy['reason'],
                 "sr_levels": sr_levels,
                 "htf_uptrend": htf_ok,
+                "entry_strategy": entry_strategy,
+                "momentum_analysis": {},
+                "confirmations": {'divergence': False, 'bullish_pattern': False, 'divergence_data': {}, 'pattern_data': {}},
+                "recommendation": "No valid entry strategy",
                 "timestamp": timestamp
             }
 
@@ -741,10 +734,12 @@ class EnhancedMomentumBot:
 
         # Confirmations
         print("\nPhase 4: Confirmation Signals (5m)...")
-        divergence = self._detect_bullish_divergence(df_sr_analysis, entry_strategy['support_level'], self._cached_last_5m_atr)
-        pattern_ok = self._bullish_candle_confirmed(df_sr_analysis, entry_strategy['support_level'], self._cached_last_5m_atr)
-        print(f"  Bullish RSI Divergence near support: {divergence}")
-        print(f"  Bullish Candlestick Pattern near support: {pattern_ok}")
+        divergence_data = self._detect_bullish_divergence(df_sr_analysis, entry_strategy['support_level'], self._cached_last_5m_atr)
+        pattern_data = self._bullish_candle_confirmed(df_sr_analysis, entry_strategy['support_level'], self._cached_last_5m_atr)
+        divergence_found = bool(divergence_data.get('found', False))
+        pattern_found = bool(pattern_data.get('found', False))
+        print(f"  Bullish RSI Divergence near support: {divergence_found}")
+        print(f"  Bullish Candlestick Pattern near support: {pattern_found}")
 
         # Momentum snapshot (kept for additional color; not required by rules)
         print("\nPhase 5: Momentum Confirmation...")
@@ -755,7 +750,7 @@ class EnhancedMomentumBot:
             entry_strategy=entry_strategy,
             momentum_result=momentum_result,
             htf_uptrend=htf_ok,
-            confirmations={'divergence': divergence, 'bullish_pattern': pattern_ok}
+            confirmations={'divergence': divergence_found, 'bullish_pattern': pattern_found}
         )
 
         result = {
@@ -765,7 +760,12 @@ class EnhancedMomentumBot:
             "momentum_analysis": momentum_result,
             "sr_levels": sr_levels,
             "htf_uptrend": htf_ok,
-            "confirmations": {'divergence': divergence, 'bullish_pattern': pattern_ok},
+            "confirmations": {
+                'divergence': divergence_found,
+                'bullish_pattern': pattern_found,
+                'divergence_data': divergence_data,
+                'pattern_data': pattern_data
+            },
             "recommendation": entry_strategy['recommendation'],
             "timestamp": timestamp
         }
@@ -832,6 +832,232 @@ class EnhancedMomentumBot:
         }
 
     # ---------------------------
+    # Visualization
+    # ---------------------------
+    def plot_analysis(self, df: pd.DataFrame, analysis_result: Dict):
+        if df is None or df.empty:
+            print("WARNING: Dataframe for plotting is empty.")
+            return None, None
+        
+        plot_df = df.tail(150).copy()
+        
+        # Ensure standard mplfinance column names
+        if 'open' in plot_df.columns:
+            plot_df = plot_df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+        
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in plot_df.columns for col in required_cols):
+            print(f"ERROR: Missing required columns for plotting. Found: {plot_df.columns.tolist()}")
+            return None, None
+
+        # --- Build Add-ons for the Plot ---
+
+        # 1. Addplots (RSI, Pattern Markers)
+        rsi_series = self.calculate_rsi(plot_df['Close'])
+        apds = [mpf.make_addplot(rsi_series, panel=1, color='#8A2BE2', width=1.0, title='RSI')]
+
+        pattern_data = analysis_result.get('confirmations', {}).get('pattern_data', {})
+        if pattern_data.get('found'):
+            ts = pattern_data.get('timestamp')
+            if ts in plot_df.index:
+                low_val = float(plot_df.loc[ts, 'Low'])
+                marker_y = low_val * 0.995  # Place marker slightly below the low
+                marker_series = pd.Series(np.nan, index=plot_df.index)
+                marker_series.loc[ts] = marker_y
+                apds.append(mpf.make_addplot(marker_series, type='scatter', marker='^', markersize=100, color='#2ca02c', panel=0))
+
+        # 2. Horizontal Lines (S/R, Entry, Stop, Target)
+        hlines_levels = []
+        hlines_colors = []
+        hlines_styles = []
+
+        sr_levels = analysis_result.get('sr_levels', {})
+        supports = sr_levels.get('supports', [])
+        resistances = sr_levels.get('resistances', [])
+        
+        for s in supports:
+            hlines_levels.append(float(s['level']))
+            hlines_colors.append('#008000') # Green
+            hlines_styles.append('dashed')
+
+        for r in resistances:
+            hlines_levels.append(float(r['level']))
+            hlines_colors.append('#CC0000') # Red
+            hlines_styles.append('dashed')
+
+        entry_strategy = analysis_result.get('entry_strategy', {})
+        if entry_strategy.get('entry_price'):
+            hlines_levels.append(entry_strategy['entry_price'])
+            hlines_colors.append('#1f77b4') # Blue
+            hlines_styles.append('solid')
+        if entry_strategy.get('stop_loss'):
+            hlines_levels.append(entry_strategy['stop_loss'])
+            hlines_colors.append('#d62728') # Darker Red
+            hlines_styles.append('solid')
+        if entry_strategy.get('targets') and entry_strategy['targets']:
+            hlines_levels.append(entry_strategy['targets'][0]['price'])
+            hlines_colors.append('#2ca02c') # Darker Green
+            hlines_styles.append('solid')
+
+        hlines_dict = dict(hlines=hlines_levels, colors=hlines_colors, linestyle=hlines_styles, linewidths=1.0) if hlines_levels else None
+
+        # 3. Alines (Divergence)
+        alines_list = []
+        divergence_data = analysis_result.get('confirmations', {}).get('divergence_data', {})
+        if divergence_data.get('found'):
+            price_points = divergence_data.get('price_points')
+            rsi_points = divergence_data.get('rsi_points')
+            if price_points:
+                alines_list.append(dict(alines=[price_points], colors=['#00ccff'], linewidths=1.5, panel=0))
+            if rsi_points:
+                alines_list.append(dict(alines=[rsi_points], colors=['#00cc66'], linewidths=1.5, panel=1))
+
+        # --- Construct Final Plotting Keyword Arguments ---
+        # Initialize kwargs WITHOUT 'alines'
+        plot_kwargs = {
+            'type': 'candle',
+            'style': 'yahoo',
+            'title': f"{self.trading_pair} - 5m Analysis\nSignal: {analysis_result.get('signal', 'N/A')}",
+            'volume': True,
+            'addplot': apds,
+            'hlines': hlines_dict,
+            'panel_ratios': (3, 1),
+            'returnfig': True,
+            'figratio': (16, 9),
+            'figscale': 1.2,
+            'tight_layout': True
+        }
+
+        # Conditionally ADD 'alines' to the dictionary if alines_list is not empty
+        if alines_list:
+            plot_kwargs['alines'] = alines_list
+
+        try:
+            fig, axes = mpf.plot(plot_df, **plot_kwargs)
+            # Add text labels for entry/stop/target as they don't have built-in labels
+            ax_main = axes[0]
+            # Use iloc for integer-based positioning relative to the plotted data
+            x_pos = len(plot_df) - 1 # Position text at the last candle
+            if entry_strategy.get('entry_price'):
+                ax_main.text(x_pos, entry_strategy['entry_price'], ' Entry', color='#1f77b4', va='center', fontsize=9)
+            if entry_strategy.get('stop_loss'):
+                ax_main.text(x_pos, entry_strategy['stop_loss'], ' Stop', color='#d62728', va='center', fontsize=9)
+            if entry_strategy.get('targets') and entry_strategy['targets']:
+                ax_main.text(x_pos, entry_strategy['targets'][0]['price'], ' Target', color='#2ca02c', va='center', fontsize=9)
+            return fig, axes
+        except Exception as e:
+            print(f"FATAL PLOTTING ERROR: {e}")
+            return None, None
+        if df is None or df.empty:
+            print("WARNING: Dataframe for plotting is empty.")
+            return None, None
+        
+        plot_df = df.tail(150).copy()
+        
+        # Ensure standard mplfinance column names
+        if 'open' in plot_df.columns:
+            plot_df = plot_df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+        
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in plot_df.columns for col in required_cols):
+            print(f"ERROR: Missing required columns for plotting. Found: {plot_df.columns.tolist()}")
+            return None, None
+
+        # --- Build Add-ons for the Plot ---
+
+        # 1. Addplots (RSI, Pattern Markers)
+        rsi_series = self.calculate_rsi(plot_df['Close'])
+        apds = [mpf.make_addplot(rsi_series, panel=1, color='#8A2BE2', width=1.0, title='RSI')]
+
+        pattern_data = analysis_result.get('confirmations', {}).get('pattern_data', {})
+        if pattern_data.get('found'):
+            ts = pattern_data.get('timestamp')
+            if ts in plot_df.index:
+                low_val = float(plot_df.loc[ts, 'Low'])
+                marker_y = low_val * 0.995  # Place marker slightly below the low
+                marker_series = pd.Series(np.nan, index=plot_df.index)
+                marker_series.loc[ts] = marker_y
+                apds.append(mpf.make_addplot(marker_series, type='scatter', marker='^', markersize=100, color='#2ca02c', panel=0))
+
+        # 2. Horizontal Lines (S/R, Entry, Stop, Target)
+        hlines_levels = []
+        hlines_colors = []
+        hlines_styles = []
+
+        sr_levels = analysis_result.get('sr_levels', {})
+        supports = sr_levels.get('supports', [])
+        resistances = sr_levels.get('resistances', [])
+        
+        for s in supports:
+            hlines_levels.append(float(s['level']))
+            hlines_colors.append('#008000') # Green
+            hlines_styles.append('dashed')
+
+        for r in resistances:
+            hlines_levels.append(float(r['level']))
+            hlines_colors.append('#CC0000') # Red
+            hlines_styles.append('dashed')
+
+        entry_strategy = analysis_result.get('entry_strategy', {})
+        if entry_strategy.get('entry_price'):
+            hlines_levels.append(entry_strategy['entry_price'])
+            hlines_colors.append('#1f77b4') # Blue
+            hlines_styles.append('solid')
+        if entry_strategy.get('stop_loss'):
+            hlines_levels.append(entry_strategy['stop_loss'])
+            hlines_colors.append('#d62728') # Darker Red
+            hlines_styles.append('solid')
+        if entry_strategy.get('targets') and entry_strategy['targets'][0]:
+            hlines_levels.append(entry_strategy['targets'][0]['price'])
+            hlines_colors.append('#2ca02c') # Darker Green
+            hlines_styles.append('solid')
+
+        hlines_dict = dict(hlines=hlines_levels, colors=hlines_colors, linestyle=hlines_styles, linewidths=1.0) if hlines_levels else None
+
+        # 3. Alines (Divergence)
+        alines_list = []
+        divergence_data = analysis_result.get('confirmations', {}).get('divergence_data', {})
+        if divergence_data.get('found'):
+            price_points = divergence_data.get('price_points')
+            rsi_points = divergence_data.get('rsi_points')
+            if price_points:
+                alines_list.append(dict(alines=[price_points], colors=['#00ccff'], linewidths=1.5, panel=0))
+            if rsi_points:
+                alines_list.append(dict(alines=[rsi_points], colors=['#00cc66'], linewidths=1.5, panel=1))
+
+        # --- Construct Final Plotting Keyword Arguments ---
+        plot_kwargs = {
+            'type': 'candle',
+            'style': 'yahoo',
+            'title': f"{self.trading_pair} - 5m Analysis\nSignal: {analysis_result.get('signal', 'N/A')}",
+            'volume': True,
+            'addplot': apds,
+            'hlines': hlines_dict,
+            'alines': alines_list if alines_list else None,
+            'panel_ratios': (3, 1), # Main panel is 3x larger than RSI panel
+            'returnfig': True,
+            'figratio': (16, 9),
+            'figscale': 1.2,
+            'tight_layout': True
+        }
+
+        try:
+            fig, axes = mpf.plot(plot_df, **plot_kwargs)
+            # Add text labels for entry/stop/target as they don't have built-in labels
+            ax_main = axes[0]
+            x_pos = len(plot_df) # Position text on the right edge
+            if entry_strategy.get('entry_price'):
+                ax_main.text(x_pos, entry_strategy['entry_price'], ' Entry', color='#1f77b4', va='center', fontsize=9)
+            if entry_strategy.get('stop_loss'):
+                ax_main.text(x_pos, entry_strategy['stop_loss'], ' Stop', color='#d62728', va='center', fontsize=9)
+            if entry_strategy.get('targets') and entry_strategy['targets'][0]:
+                ax_main.text(x_pos, entry_strategy['targets'][0]['price'], ' Target', color='#2ca02c', va='center', fontsize=9)
+            return fig, axes
+        except Exception as e:
+            print(f"FATAL PLOTTING ERROR: {e}")
+            return None, None
+
+    # ---------------------------
     # Runner
     # ---------------------------
     def run_enhanced_analysis(self):
@@ -852,6 +1078,19 @@ class EnhancedMomentumBot:
                 best_target = result['entry_strategy']['targets'][0]
                 print(f"Primary Target: ${best_target['price']:.6f} (R:R {best_target['reward_risk_ratio']:.2f})")
         print(f"{'='*50}")
+
+        if hasattr(self, '_last_df_sr_analysis'):
+            try:
+                fig, axes = self.plot_analysis(self._last_df_sr_analysis, result)
+                if fig is not None:
+                    # Save the plot as an image file since we're using non-interactive backend
+                    filename = f"{self.trading_pair.replace('/', '_')}_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                    fig.savefig(filename, dpi=150, bbox_inches='tight')
+                    print(f"📊 Analysis plot saved as: {filename}")
+                    plt.close(fig)  # Close the figure to free memory
+            except Exception as e:
+                print(f"Plotting error: {e}")
+
         return result
 
 
