@@ -4,10 +4,11 @@ import pandas as pd
 import numpy as np
 import time
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import warnings
 from scipy.signal import argrelextrema
+import matplotlib.pyplot as plt
 
 # Suppress pandas warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -15,39 +16,66 @@ warnings.filterwarnings('ignore')
 
 class EnhancedMomentumBot:
     """
-    Enhanced Trading Bot with Support/Resistance Analysis
+    Enhanced Trading Bot with institutional-grade quantitative analysis.
     
-    Features:
-    - Automatic support/resistance identification
-    - Entry calculations based on support levels
-    - Multi-timeframe S/R analysis
-    - Risk management based on S/R levels
+    This bot moves beyond simple indicators to a sophisticated, multi-layered
+    approach for generating high-probability trading signals.
+
+    Key Enhancements:
+    1.  **Confluence-Based S/R Analysis**: Identifies and scores S/R zones where multiple
+        analytical methods (swing points, volume profile, Fibonacci) converge.
+    2.  **Adaptive S/R Detection**: Uses Average True Range (ATR) to dynamically adjust
+        clustering sensitivity based on market volatility.
+    3.  **Time-Weighted Strength**: Gives more importance to recent price interactions with S/R levels.
+    4.  **Higher-Timeframe Trend Filter**: Ensures trades are only taken in alignment with the
+        dominant market trend (e.g., daily or 4-hour).
+    5.  **Advanced Confirmation Signals**:
+        - **Bullish RSI Divergence**: Detects potential trend reversals near key support.
+        - **Candlestick Pattern Recognition**: Waits for bullish confirmation patterns (e.g., Hammer, Engulfing)
+          before signaling an entry.
+    6.  **Dynamic Risk Management**:
+        - **ATR-Based Stop-Loss**: Sets stop-losses outside of typical market noise.
+        - **Reward/Risk Validation**: Ensures potential trades meet a minimum R:R ratio before they are considered valid.
+    7.  **Rule-Based Signal Engine**: Replaces a simplistic scoring system with a strict,
+        multi-conditional logic to generate STRONG_BUY signals only on A+ setups.
     """
     
     def __init__(self, trading_pair: str, exchange_name: str = 'binance'):
         self.trading_pair = trading_pair
         self.exchange_name = exchange_name
         
-        # Configuration parameters
+        # --- Enhanced Configuration Parameters ---
         self.config = {
-            'trend_tolerance': 0.02,
-            'strong_buy_threshold': 75,
-            'buy_threshold': 60,
-            'pullback_tolerance': 0.005,
-            'rsi_threshold_high': 75,
-            'rsi_threshold_low': 30,
-            'crossover_lookback': 5,
-            'volume_confirmation': True,
-            
-            # Support/Resistance parameters
-            'sr_lookback_periods': 50,      # Periods to look back for S/R
-            'sr_min_touches': 2,            # Minimum touches to confirm S/R
-            'sr_proximity_threshold': 0.01, # 1% proximity to consider a touch
-            'fibonacci_enabled': True,      # Enable Fibonacci retracements
-            'pivot_order': 5,               # Order for scipy peak detection
-            'sr_strength_threshold': 3,     # Minimum strength for valid S/R
-            'entry_buffer': 0.002,          # 0.2% buffer above support for entry
-            'stop_loss_ratio': 0.015,       # 1.5% below support for stop loss
+            # Timeframes
+            'higher_timeframe': '4h',             # Timeframe for primary trend analysis
+            'entry_timeframe': '5m',              # Timeframe for entry signals
+            'sr_timeframe': '1h',                 # Timeframe for robust S/R level calculation
+
+            # Higher-Timeframe Trend Filter
+            'htf_ema_short': 50,                  # Short EMA for HTF trend
+            'htf_ema_long': 200,                  # Long EMA for HTF trend
+
+            # S/R Analysis & Confluence
+            'sr_lookback_periods': 250,           # Increased lookback for more S/R data
+            'sr_min_touches': 2,                  # Minimum touches to initially form a cluster
+            'pivot_order': 10,                    # Order for scipy peak detection (wider swings)
+            'atr_period': 14,                     # Period for ATR calculation
+            'atr_clustering_multiplier': 0.5,     # Proximity = 0.5 * ATR. Lower for tighter clusters.
+            'confluence_multiplier': 2.5,         # Multiplier for strength of confluence zones
+            'time_decay_factor': 0.97,            # Decay for time-weighting (e.g., 0.97^n candles ago)
+            'volume_profile_bins': 30,            # Bins for volume profile analysis
+
+            # Fibonacci Analysis
+            'fibonacci_enabled': True,            # Enable Fibonacci retracements
+
+            # Confirmation Signals
+            'divergence_lookback': 30,            # Lookback period for RSI divergence detection
+            'rsi_period': 14,
+
+            # Risk Management
+            'atr_stop_loss_multiplier': 2.0,      # Stop Loss = Support - (ATR * 2.0)
+            'min_reward_to_risk_ratio': 1.5,      # Minimum R:R for a trade to be valid
+            'entry_buffer_atr_multiplier': 0.2,   # Entry buffer = 0.2 * ATR above support
         }
         
         try:
@@ -62,599 +90,459 @@ class EnhancedMomentumBot:
             print(f"Error initializing exchange {exchange_name}: {e}")
             sys.exit(1)
             
-        print(f"Initialized {self.__class__.__name__} for {trading_pair} on {exchange_name}")
-    
-    def fetch_ohlcv_data(self, timeframe: str, limit: int = 100) -> pd.DataFrame:
-        """Fetch OHLCV data from the exchange."""
+        print(f"Initialized {self.__class__.__name__} for {self.trading_pair} on {self.exchange_name}")
+
+    def fetch_ohlcv_data(self, timeframe: str, limit: int = 300) -> pd.DataFrame:
+        """Fetch OHLCV data and calculate ATR and RSI."""
         try:
             ohlcv = self.exchange.fetch_ohlcv(
                 symbol=self.trading_pair,
                 timeframe=timeframe,
                 limit=limit
             )
-            
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            
+            if df.empty: return df
+
+            # Calculate essential indicators
+            df['atr'] = self.calculate_atr(df['high'], df['low'], df['close'], period=self.config['atr_period'])
+            df['rsi'] = self.calculate_rsi(df['close'], period=self.config['rsi_period'])
             return df
             
         except Exception as e:
             print(f"Error fetching {timeframe} data: {e}")
             return pd.DataFrame()
-    
-    def identify_swing_points(self, df: pd.DataFrame) -> Tuple[List[Tuple], List[Tuple]]:
-        """
-        Identify swing highs and lows using scipy's peak detection.
-        
-        Returns:
-            Tuple of (swing_highs, swing_lows) with (index, price) tuples
-        """
-        order = self.config['pivot_order']
-        
-        # Find swing highs
-        high_indices = argrelextrema(df['high'].values, np.greater, order=order)[0]
-        swing_highs = [(df.index[i], df['high'].iloc[i]) for i in high_indices]
-        
-        # Find swing lows
-        low_indices = argrelextrema(df['low'].values, np.less, order=order)[0]
-        swing_lows = [(df.index[i], df['low'].iloc[i]) for i in low_indices]
-        
-        return swing_highs, swing_lows
-    
+
+    # --- Core S/R Analysis Enhancements ---
+
     def calculate_support_resistance_levels(self, df: pd.DataFrame) -> Dict:
-        """
-        Calculate support and resistance levels using multiple methods.
-        
-        Returns:
-            Dictionary with support/resistance levels and their strengths
-        """
+        """Calculates S/R levels using multiple methods and identifies confluence zones."""
         swing_highs, swing_lows = self.identify_swing_points(df)
+        all_levels = []
         
-        # Method 1: Swing Point Clustering
-        support_levels = self._cluster_price_levels([price for _, price in swing_lows])
-        resistance_levels = self._cluster_price_levels([price for _, price in swing_highs])
-        
-        # Method 2: Psychological Levels (round numbers)
-        psychological_levels = self._find_psychological_levels(df['close'].iloc[-1])
-        
-        # Method 3: Volume Profile (simplified)
+        # Method 1: Swing Points
+        all_levels.extend([{'level': p, 'type': 'swing_high'} for _, p in swing_highs])
+        all_levels.extend([{'level': p, 'type': 'swing_low'} for _, p in swing_lows])
+
+        # Method 2: Volume Profile
         volume_levels = self._calculate_volume_profile(df)
+        all_levels.extend([{'level': lvl['level'], 'type': 'volume'} for lvl in volume_levels])
         
-        # Method 4: Fibonacci Retracements
-        fibonacci_levels = {}
-        if self.config['fibonacci_enabled'] and len(swing_highs) > 0 and len(swing_lows) > 0:
-            fibonacci_levels = self._calculate_fibonacci_levels(swing_highs, swing_lows)
+        # Method 3: Fibonacci Retracements
+        if self.config['fibonacci_enabled'] and swing_highs and swing_lows:
+            fib_levels = self._calculate_fibonacci_levels(df)
+            all_levels.extend([{'level': lvl['level'], 'type': 'fibonacci'} for lvl in fib_levels.values()])
+
+        # New Step: Cluster all levels to find confluence and score them
+        scored_levels = self._cluster_and_score_levels(df, all_levels)
         
-        # Combine and score all levels
-        all_levels = {
-            'support_swing': support_levels,
-            'resistance_swing': resistance_levels,
-            'psychological': psychological_levels,
-            'volume_profile': volume_levels,
-            'fibonacci': fibonacci_levels
+        current_price = df['close'].iloc[-1]
+        supports = sorted([lvl for lvl in scored_levels if lvl['level'] < current_price], key=lambda x: x['level'], reverse=True)
+        resistances = sorted([lvl for lvl in scored_levels if lvl['level'] >= current_price], key=lambda x: x['level'])
+        
+        return {
+            'supports': supports[:7],
+            'resistances': resistances[:7],
+            'current_price': current_price
         }
-        
-        # Score and filter levels
-        scored_levels = self._score_sr_levels(df, all_levels)
-        
-        return scored_levels
-    
-    def _cluster_price_levels(self, prices: List[float]) -> List[Dict]:
+
+    def _cluster_and_score_levels(self, df: pd.DataFrame, levels: List[Dict]) -> List[Dict]:
         """
-        Cluster similar price levels together.
-        
-        Returns:
-            List of support/resistance levels with metadata
+        Volatility-adaptive clustering to find confluence zones and score them.
+        This is a major enhancement combining Confluence, Time-Weighting, and Volatility-Adaptivity.
         """
-        if not prices:
+        if not levels:
             return []
+
+        atr = df['atr'].iloc[-1]
+        # Volatility-Adaptive Proximity Threshold
+        proximity_threshold = atr * self.config['atr_clustering_multiplier']
         
-        prices = sorted(prices)
-        levels = []
-        proximity_threshold = self.config['sr_proximity_threshold']
+        levels.sort(key=lambda x: x['level'])
         
-        current_cluster = [prices[0]]
+        clustered_zones = []
+        current_cluster = [levels[0]]
         
-        for price in prices[1:]:
-            # Check if price is within proximity of current cluster
-            cluster_avg = sum(current_cluster) / len(current_cluster)
-            
-            if abs(price - cluster_avg) / cluster_avg <= proximity_threshold:
-                current_cluster.append(price)
+        for level_info in levels[1:]:
+            cluster_avg = np.mean([l['level'] for l in current_cluster])
+            if abs(level_info['level'] - cluster_avg) <= proximity_threshold:
+                current_cluster.append(level_info)
             else:
-                # Finalize current cluster
-                if len(current_cluster) >= self.config['sr_min_touches']:
-                    levels.append({
-                        'level': sum(current_cluster) / len(current_cluster),
-                        'strength': len(current_cluster),
-                        'touches': current_cluster.copy(),
-                        'type': 'swing_cluster'
-                    })
-                current_cluster = [price]
-        
-        # Don't forget the last cluster
-        if len(current_cluster) >= self.config['sr_min_touches']:
-            levels.append({
-                'level': sum(current_cluster) / len(current_cluster),
-                'strength': len(current_cluster),
-                'touches': current_cluster.copy(),
-                'type': 'swing_cluster'
+                clustered_zones.append(current_cluster)
+                current_cluster = [level_info]
+        clustered_zones.append(current_cluster)
+
+        final_levels = []
+        for zone in clustered_zones:
+            zone_level = np.mean([l['level'] for l in zone])
+            
+            # Confluence Scoring
+            methods_in_zone = set(l['type'] for l in zone)
+            base_strength = len(zone)
+            confluence_score = base_strength * self.config['confluence_multiplier'] if len(methods_in_zone) > 1 else base_strength
+
+            # Time-Weighted Touch Scoring
+            time_weighted_strength = self._count_recent_touches(df, zone_level, proximity_threshold)
+            
+            total_strength = confluence_score + time_weighted_strength
+            
+            final_levels.append({
+                'level': zone_level,
+                'strength': round(total_strength, 2),
+                'methods': list(methods_in_zone),
+                'is_confluence': len(methods_in_zone) > 1
             })
+
+        return sorted(final_levels, key=lambda x: x['strength'], reverse=True)
+
+    def _count_recent_touches(self, df: pd.DataFrame, level: float, proximity: float) -> float:
+        """Counts recent touches with time-weighted decay."""
+        touches_score = 0.0
+        decay = self.config['time_decay_factor']
+        recent_data = df.tail(self.config['sr_lookback_periods'])
         
-        return levels
-    
-    def _find_psychological_levels(self, current_price: float) -> List[Dict]:
-        """
-        Find psychological support/resistance levels (round numbers).
-        """
-        levels = []
-        
-        # Determine the appropriate round number based on price magnitude
-        if current_price >= 100:
-            increments = [10, 50, 100]
-        elif current_price >= 10:
-            increments = [1, 5, 10]
-        elif current_price >= 1:
-            increments = [0.1, 0.5, 1]
+        for i, candle in enumerate(recent_data.itertuples()):
+            if candle.low <= level <= candle.high:
+                candles_ago = len(recent_data) - 1 - i
+                weight = decay ** candles_ago
+                touches_score += weight
+
+        return touches_score * 5 # Scale the score
+
+    # --- Advanced Confirmation Signal Functions ---
+
+    def _get_higher_timeframe_trend(self, df_htf: pd.DataFrame) -> str:
+        """Determines the primary trend from a higher timeframe."""
+        if df_htf.empty or len(df_htf) < self.config['htf_ema_long']:
+            return 'INSUFFICIENT_DATA'
+
+        short_ema = df_htf['close'].ewm(span=self.config['htf_ema_short'], adjust=False).mean().iloc[-1]
+        long_ema = df_htf['close'].ewm(span=self.config['htf_ema_long'], adjust=False).mean().iloc[-1]
+        current_price = df_htf['close'].iloc[-1]
+
+        if current_price > short_ema and short_ema > long_ema:
+            return 'UPTREND'
+        elif current_price < short_ema and short_ema < long_ema:
+            return 'DOWNTREND'
         else:
-            increments = [0.001, 0.01, 0.1]
+            return 'SIDEWAYS'
+
+    def _detect_bullish_divergence(self, df: pd.DataFrame) -> bool:
+        """Detects bullish divergence between price lows and RSI lows."""
+        lookback = self.config['divergence_lookback']
+        if len(df) < lookback: return False
+
+        data = df.tail(lookback)
+        price_lows_indices = argrelextrema(data['low'].values, np.less, order=5)[0]
+        rsi_lows_indices = argrelextrema(data['rsi'].values, np.less, order=5)[0]
         
-        for increment in increments:
-            # Find nearest round levels above and below current price
-            lower_level = (int(current_price / increment)) * increment
-            upper_level = lower_level + increment
-            
-            # Add levels within reasonable range (±20% of current price)
-            price_range = current_price * 0.2
-            
-            for level in [lower_level, upper_level]:
-                if abs(level - current_price) <= price_range and level > 0:
-                    levels.append({
-                        'level': level,
-                        'strength': 2,  # Base strength for psychological levels
-                        'type': 'psychological',
-                        'increment': increment
-                    })
+        if len(price_lows_indices) < 2 or len(rsi_lows_indices) < 2:
+            return False
+
+        # Get the last two price and RSI lows
+        last_price_low_idx = price_lows_indices[-1]
+        prev_price_low_idx = price_lows_indices[-2]
         
-        return levels
+        last_rsi_low_idx = -1
+        # Find the RSI low that corresponds to the last price low
+        for idx in reversed(rsi_lows_indices):
+            if abs(idx - last_price_low_idx) < 3: # Allow a small window
+                last_rsi_low_idx = idx
+                break
+        
+        prev_rsi_low_idx = -1
+        # Find the RSI low that corresponds to the previous price low
+        for idx in reversed(rsi_lows_indices):
+            if idx < last_rsi_low_idx and abs(idx - prev_price_low_idx) < 3:
+                prev_rsi_low_idx = idx
+                break
+
+        if last_rsi_low_idx == -1 or prev_rsi_low_idx == -1:
+            return False
+
+        # Check for divergence condition
+        price_makes_lower_low = data['low'].iloc[last_price_low_idx] < data['low'].iloc[prev_price_low_idx]
+        rsi_makes_higher_low = data['rsi'].iloc[last_rsi_low_idx] > data['rsi'].iloc[prev_rsi_low_idx]
+
+        return price_makes_lower_low and rsi_makes_higher_low
+
+    def _identify_bullish_candlestick(self, df: pd.DataFrame) -> Optional[str]:
+        """Identifies bullish reversal candlestick patterns on the last closed candle."""
+        if len(df) < 2: return None
+        
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        body_size = abs(last['open'] - last['close'])
+        candle_range = last['high'] - last['low']
+        if candle_range == 0: return None
+        
+        # Hammer
+        is_hammer = (
+            (last['close'] > last['open']) and
+            (body_size / candle_range < 0.3) and
+            ((last['high'] - last['close']) / candle_range < 0.2) and
+            ((last['open'] - last['low']) / candle_range > 0.6)
+        )
+        if is_hammer: return "Hammer"
+        
+        # Bullish Engulfing
+        is_bullish_engulfing = (
+            prev['close'] < prev['open'] and # Previous candle is red
+            last['close'] > last['open'] and  # Current candle is green
+            last['close'] > prev['open'] and
+            last['open'] < prev['close']
+        )
+        if is_bullish_engulfing: return "Bullish Engulfing"
+        
+        # Doji (at support)
+        is_doji = body_size / candle_range < 0.1
+        if is_doji: return "Doji"
+
+        return None
     
-    def _calculate_volume_profile(self, df: pd.DataFrame, bins: int = 20) -> List[Dict]:
+    # --- Improved Risk Management & Trade Setup ---
+
+    def generate_trade_setup(self, sr_levels: Dict, df_entry: pd.DataFrame) -> Dict:
         """
-        Calculate simplified volume profile levels.
+        Calculates a full trade setup with dynamic SL/TP and validates R:R.
         """
-        if df.empty:
-            return []
+        if not sr_levels['supports'] or df_entry.empty:
+            return {'valid': False, 'reason': 'No valid support levels or entry data.'}
+
+        current_price = sr_levels['current_price']
+        primary_support = sr_levels['supports'][0]
+        support_level = primary_support['level']
         
-        # Create price bins
-        price_min = df['low'].min()
-        price_max = df['high'].max()
-        price_bins = np.linspace(price_min, price_max, bins + 1)
+        # Only consider setups close to a strong support level
+        if (current_price - support_level) / current_price > 0.03: # Price is >3% away
+            return {'valid': False, 'reason': f"Price is too far from primary support ${support_level:.4f}."}
+
+        atr = df_entry['atr'].iloc[-1]
+        if atr is None or np.isnan(atr):
+            return {'valid': False, 'reason': 'ATR is not available on entry timeframe.'}
+
+        # Dynamic ATR-based Stop Loss and Entry
+        entry_buffer = atr * self.config['entry_buffer_atr_multiplier']
+        entry_price = support_level + entry_buffer
+        stop_loss = support_level - (atr * self.config['atr_stop_loss_multiplier'])
+        risk_per_share = entry_price - stop_loss
         
-        volume_profile = []
-        
-        for i in range(bins):
-            bin_low = price_bins[i]
-            bin_high = price_bins[i + 1]
-            bin_mid = (bin_low + bin_high) / 2
-            
-            # Calculate volume for this price range
-            mask = (df['low'] <= bin_high) & (df['high'] >= bin_low)
-            bin_volume = df.loc[mask, 'volume'].sum()
-            
-            if bin_volume > 0:
-                volume_profile.append({
-                    'level': bin_mid,
-                    'strength': bin_volume,
-                    'type': 'volume_profile',
-                    'volume': bin_volume
+        if risk_per_share <= 0:
+            return {'valid': False, 'reason': 'Invalid risk calculation (SL above entry).'}
+
+        # Validate Take Profit against R:R ratio
+        valid_targets = []
+        if not sr_levels['resistances']:
+            return {'valid': False, 'reason': 'No resistance levels found for targets.'}
+
+        for i, resistance in enumerate(sr_levels['resistances']):
+            target_price = resistance['level']
+            reward_per_share = target_price - entry_price
+            if reward_per_share > 0:
+                rr_ratio = reward_per_share / risk_per_share
+                valid_targets.append({
+                    'target_num': i + 1,
+                    'price': target_price,
+                    'rr_ratio': round(rr_ratio, 2),
                 })
         
-        # Sort by volume and return top levels
-        volume_profile.sort(key=lambda x: x['volume'], reverse=True)
-        return volume_profile[:10]  # Return top 10 volume levels
-    
-    def _calculate_fibonacci_levels(self, swing_highs: List[Tuple], swing_lows: List[Tuple]) -> Dict:
+        if not valid_targets:
+            return {'valid': False, 'reason': 'No viable targets with positive reward.'}
+
+        # Check if the *first* target meets the minimum R:R
+        if valid_targets[0]['rr_ratio'] < self.config['min_reward_to_risk_ratio']:
+            return {
+                'valid': False,
+                'reason': f"Primary target R:R is {valid_targets[0]['rr_ratio']:.2f}, "
+                          f"below minimum of {self.config['min_reward_to_risk_ratio']}"
+            }
+
+        return {
+            'valid': True,
+            'primary_support': primary_support,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'targets': valid_targets,
+            'risk_per_share': risk_per_share
+        }
+
+    # --- Main Analysis & Signal Generation Engine ---
+
+    def analyze_market_with_sr(self) -> Dict:
         """
-        Calculate Fibonacci retracement levels from recent significant moves.
+        The main orchestration function that performs the complete, multi-layered analysis.
         """
-        if not swing_highs or not swing_lows:
-            return {}
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n{'='*80}")
+        print(f"QUANTITATIVE ANALYSIS REPORT - {timestamp}")
+        print(f"Trading Pair: {self.trading_pair} | Primary Trend TF: {self.config['higher_timeframe']} | Entry TF: {self.config['entry_timeframe']}")
+        print(f"{'='*80}")
+
+        # 1. Fetch Data
+        df_htf = self.fetch_ohlcv_data(self.config['higher_timeframe'], limit=self.config['htf_ema_long'] + 50)
+        df_sr = self.fetch_ohlcv_data(self.config['sr_timeframe'], limit=self.config['sr_lookback_periods'])
+        df_entry = self.fetch_ohlcv_data(self.config['entry_timeframe'], limit=200)
+
+        if df_htf.empty or df_sr.empty or df_entry.empty:
+            return {"signal": "HOLD", "reason": "Insufficient data for one or more timeframes."}
+
+        # 2. Higher-Timeframe Trend Analysis
+        print("\n[1] PRIMARY TREND ANALYSIS...")
+        htf_trend = self._get_higher_timeframe_trend(df_htf)
+        print(f"-> Higher-Timeframe ({self.config['higher_timeframe']}) Trend is: {htf_trend}")
+        if htf_trend != 'UPTREND':
+            print("-> Condition Failed: Primary trend is not bullish. No BUY signals will be generated.")
+            return {"signal": "HOLD", "reason": f"Primary trend is {htf_trend}, not UPTREND."}
+
+        # 3. S/R Confluence Zone Analysis
+        print("\n[2] SUPPORT/RESISTANCE CONFLUENCE ANALYSIS...")
+        sr_levels = self.calculate_support_resistance_levels(df_sr)
+        self._log_sr_levels(sr_levels)
         
-        # Find the most recent significant high and low
-        recent_high = max(swing_highs, key=lambda x: x[1])
-        recent_low = min(swing_lows, key=lambda x: x[1])
+        # 4. Generate & Validate Trade Setup
+        print("\n[3] TRADE SETUP VALIDATION (Entry, SL, TP, R:R)...")
+        trade_setup = self.generate_trade_setup(sr_levels, df_entry)
+        if not trade_setup['valid']:
+            print(f"-> Invalid Trade Setup: {trade_setup['reason']}")
+            return {"signal": "WAIT", "reason": trade_setup['reason'], "sr_levels": sr_levels}
+        self._log_trade_setup(trade_setup)
+
+        # 5. Confirmation Signal Analysis
+        print("\n[4] ENTRY CONFIRMATION ANALYSIS...")
+        is_divergence = self._detect_bullish_divergence(df_entry)
+        bullish_pattern = self._identify_bullish_candlestick(df_entry)
+        print(f"-> Bullish RSI Divergence Detected: {is_divergence}")
+        print(f"-> Bullish Candlestick Pattern Found: {bullish_pattern if bullish_pattern else 'None'}")
         
-        high_price = recent_high[1]
-        low_price = recent_low[1]
+        # 6. Final Signal Generation
+        print("\n[5] FINAL SIGNAL GENERATION...")
+        final_signal = self._generate_final_signal(htf_trend, trade_setup, is_divergence, bullish_pattern)
         
-        # Fibonacci ratios
+        print(f"\n{'='*30} FINAL RESULT {'='*30}")
+        print(f"-> SIGNAL: {final_signal['signal']}")
+        print(f"-> REASON: {final_signal['reason']}")
+        print(f"{'='*80}")
+        
+        return {
+            "signal": final_signal['signal'],
+            "reason": final_signal['reason'],
+            "trade_setup": trade_setup,
+            "confirmations": {"divergence": is_divergence, "candlestick": bullish_pattern},
+            "primary_trend": htf_trend,
+            "sr_levels": sr_levels,
+            "timestamp": timestamp
+        }
+
+    def _generate_final_signal(self, htf_trend: str, trade_setup: Dict, is_divergence: bool, bullish_pattern: Optional[str]) -> Dict:
+        """
+        A strict, rule-based engine to generate the final signal.
+        """
+        # A "High-Probability Setup" requires multiple conditions to be met.
+        is_high_prob_setup = all([
+            htf_trend == 'UPTREND',
+            trade_setup['valid'],
+            trade_setup['primary_support']['strength'] > 10, # Require a reasonably strong support
+            trade_setup['primary_support']['is_confluence'], # Require confluence
+            is_divergence or (bullish_pattern is not None)
+        ])
+        
+        if is_high_prob_setup:
+            reasons = []
+            if trade_setup['primary_support']['is_confluence']: reasons.append("Confluence Support")
+            if is_divergence: reasons.append("Bullish Divergence")
+            if bullish_pattern: reasons.append(f"{bullish_pattern} Pattern")
+            reason_str = " + ".join(reasons)
+            return {
+                "signal": "STRONG_BUY",
+                "reason": f"High-probability setup confirmed: {reason_str}."
+            }
+
+        # A standard BUY signal might be a good setup but missing one confirmation element.
+        is_standard_setup = all([
+            htf_trend == 'UPTREND',
+            trade_setup['valid'],
+            trade_setup['primary_support']['strength'] > 5
+        ])
+        
+        if is_standard_setup:
+            return {
+                "signal": "BUY",
+                "reason": "Valid setup in an uptrend, awaiting strong confirmation (divergence/pattern)."
+            }
+
+        # Default to WAIT if a setup is forming but not yet valid.
+        return {
+            "signal": "WAIT",
+            "reason": "Market conditions are favorable, but no valid trade setup meets all criteria yet."
+        }
+
+    # --- Utility and Helper Functions ---
+    def calculate_atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.ewm(alpha=1/period, adjust=False).mean()
+
+    def calculate_rsi(self, data: pd.Series, period: int = 14) -> pd.Series:
+        delta = data.diff()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/period, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+        
+    def identify_swing_points(self, df: pd.DataFrame) -> Tuple[List, List]:
+        order = self.config['pivot_order']
+        high_indices = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
+        low_indices = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
+        swing_highs = [(df.index[i], df['high'].iloc[i]) for i in high_indices]
+        swing_lows = [(df.index[i], df['low'].iloc[i]) for i in low_indices]
+        return swing_highs, swing_lows
+
+    def _calculate_volume_profile(self, df: pd.DataFrame) -> List[Dict]:
+        bins = self.config['volume_profile_bins']
+        vp = df.groupby(pd.cut(df['close'], bins))['volume'].sum().sort_values(ascending=False)
+        return [{'level': interval.mid, 'volume': vol} for interval, vol in vp.head(10).items()]
+
+    def _calculate_fibonacci_levels(self, df: pd.DataFrame) -> Dict:
+        lookback_df = df.tail(self.config['sr_lookback_periods'])
+        high_price = lookback_df['high'].max()
+        low_price = lookback_df['low'].min()
         fib_ratios = [0.236, 0.382, 0.5, 0.618, 0.786]
-        
         levels = {}
-        
-        # Calculate retracement levels from high to low
         if high_price > low_price:
             for ratio in fib_ratios:
                 fib_level = high_price - (high_price - low_price) * ratio
-                levels[f'fib_{ratio}'] = {
-                    'level': fib_level,
-                    'strength': 3,  # Base strength for Fibonacci levels
-                    'type': 'fibonacci_retracement',
-                    'ratio': ratio,
-                    'from_high': high_price,
-                    'from_low': low_price
-                }
-        
+                levels[f'fib_{ratio}'] = {'level': fib_level}
         return levels
-    
-    def _score_sr_levels(self, df: pd.DataFrame, all_levels: Dict) -> Dict:
-        """
-        Score all support/resistance levels and filter by strength.
-        """
-        current_price = df['close'].iloc[-1]
-        scored_supports = []
-        scored_resistances = []
-        
-        # Combine all levels
-        combined_levels = []
-        for category, levels in all_levels.items():
-            if isinstance(levels, list):
-                combined_levels.extend(levels)
-            elif isinstance(levels, dict):
-                combined_levels.extend(levels.values())
-        
-        for level_info in combined_levels:
-            level = level_info['level']
-            base_strength = level_info['strength']
-            
-            # Additional scoring based on recent price action
-            recent_touches = self._count_recent_touches(df, level)
-            age_factor = 1.0  # Could be enhanced with time-based scoring
-            
-            total_strength = base_strength + recent_touches * 2
-            
-            # Classify as support or resistance based on current price
-            if level < current_price:
-                scored_supports.append({
-                    **level_info,
-                    'total_strength': total_strength,
-                    'distance_pct': (current_price - level) / current_price,
-                    'recent_touches': recent_touches
-                })
-            else:
-                scored_resistances.append({
-                    **level_info,
-                    'total_strength': total_strength,
-                    'distance_pct': (level - current_price) / current_price,
-                    'recent_touches': recent_touches
-                })
-        
-        # Filter by minimum strength and sort
-        min_strength = self.config['sr_strength_threshold']
-        
-        valid_supports = [s for s in scored_supports if s['total_strength'] >= min_strength]
-        valid_resistances = [r for r in scored_resistances if r['total_strength'] >= min_strength]
-        
-        # Sort by strength and proximity
-        valid_supports.sort(key=lambda x: (x['distance_pct'], -x['total_strength']))
-        valid_resistances.sort(key=lambda x: (x['distance_pct'], -x['total_strength']))
-        
-        return {
-            'supports': valid_supports[:5],  # Top 5 support levels
-            'resistances': valid_resistances[:5],  # Top 5 resistance levels
-            'current_price': current_price
-        }
-    
-    def _count_recent_touches(self, df: pd.DataFrame, level: float, lookback: int = 20) -> int:
-        """
-        Count how many times price has touched a level recently.
-        """
-        if lookback > len(df):
-            lookback = len(df)
-        
-        recent_data = df.tail(lookback)
-        proximity = level * self.config['sr_proximity_threshold']
-        
-        touches = 0
-        for _, candle in recent_data.iterrows():
-            if (candle['low'] <= level + proximity and 
-                candle['high'] >= level - proximity):
-                touches += 1
-        
-        return touches
-    
-    def calculate_entry_strategy(self, sr_levels: Dict) -> Dict:
-        """
-        Calculate entry strategy based on nearest support level.
-        
-        Returns:
-            Dictionary with entry point, stop loss, and targets
-        """
-        current_price = sr_levels['current_price']
-        supports = sr_levels['supports']
-        resistances = sr_levels['resistances']
-        
-        if not supports:
-            return {
-                'entry_valid': False,
-                'reason': 'No valid support levels found'
-            }
-        
-        # Find the strongest nearby support
-        nearest_support = None
-        for support in supports:
-            # Look for support within reasonable distance (max 5% below current price)
-            if support['distance_pct'] <= 0.05:
-                nearest_support = support
-                break
-        
-        if not nearest_support:
-            return {
-                'entry_valid': False,
-                'reason': 'No nearby support levels found'
-            }
-        
-        support_level = nearest_support['level']
-        entry_buffer = self.config['entry_buffer']
-        stop_loss_ratio = self.config['stop_loss_ratio']
-        
-        # Calculate entry point (slightly above support)
-        entry_price = support_level * (1 + entry_buffer)
-        
-        # Calculate stop loss (below support)
-        stop_loss = support_level * (1 - stop_loss_ratio)
-        
-        # Calculate targets based on nearest resistances
-        targets = []
-        if resistances:
-            for i, resistance in enumerate(resistances[:3]):  # Use first 3 resistances as targets
-                target_price = resistance['level']
-                risk = entry_price - stop_loss
-                reward = target_price - entry_price
-                
-                if reward > 0:
-                    targets.append({
-                        'target': i + 1,
-                        'price': target_price,
-                        'reward_risk_ratio': reward / risk if risk > 0 else 0,
-                        'potential_profit_pct': ((target_price - entry_price) / entry_price) * 100
-                    })
-        
-        # Calculate position sizing based on risk
-        risk_per_trade = 0.02  # Risk 2% of account per trade
-        risk_amount = entry_price - stop_loss
-        risk_pct = (risk_amount / entry_price) * 100
-        
-        return {
-            'entry_valid': True,
-            'support_level': support_level,
-            'support_strength': nearest_support['total_strength'],
-            'support_type': nearest_support['type'],
-            'entry_price': entry_price,
-            'stop_loss': stop_loss,
-            'risk_pct': risk_pct,
-            'targets': targets,
-            'distance_to_support_pct': nearest_support['distance_pct'] * 100,
-            'recommendation': self._generate_entry_recommendation(current_price, entry_price, targets)
-        }
-    
-    def _generate_entry_recommendation(self, current_price: float, entry_price: float, targets: List[Dict]) -> str:
-        """Generate entry recommendation based on analysis."""
-        price_diff_pct = ((current_price - entry_price) / entry_price) * 100
-        
-        if not targets:
-            return "HOLD - No clear targets identified"
-        
-        best_target = max(targets, key=lambda x: x['reward_risk_ratio'])
-        
-        if price_diff_pct > 2:
-            return f"WAIT - Price {price_diff_pct:.1f}% above entry. Wait for pullback to support."
-        elif price_diff_pct > -0.5:
-            return f"BUY - Price near entry level. R:R ratio {best_target['reward_risk_ratio']:.2f}"
-        else:
-            return f"STRONG_BUY - Price below entry. Excellent R:R ratio {best_target['reward_risk_ratio']:.2f}"
-    
-    def analyze_market_with_sr(self) -> Dict:
-        """
-        Perform complete market analysis with support/resistance integration.
-        """
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"\n{'='*70}")
-        print(f"Enhanced Market Analysis with Support/Resistance - {timestamp}")
-        print(f"Trading Pair: {self.trading_pair}")
-        print(f"{'='*70}")
-        
-        # Fetch data for S/R analysis
-        df_1h = self.fetch_ohlcv_data('1h', limit=100)
-        df_5m = self.fetch_ohlcv_data('5m', limit=200)
-        
-        if df_1h.empty or df_5m.empty:
-            return {"error": "Insufficient data for analysis"}
-        
-        print("Phase 1: Calculating Support/Resistance Levels...")
-        
-        # Calculate S/R levels on 1h timeframe for better reliability
-        sr_levels = self.calculate_support_resistance_levels(df_1h)
-        
-        # Display S/R levels
-        print(f"\n📊 Support Levels Found:")
-        for i, support in enumerate(sr_levels['supports']):
-            print(f"  S{i+1}: ${support['level']:.6f} (Strength: {support['total_strength']:.1f}, "
-                  f"Distance: {support['distance_pct']*100:.2f}%, Type: {support['type']})")
-        
-        print(f"\n📊 Resistance Levels Found:")
-        for i, resistance in enumerate(sr_levels['resistances']):
-            print(f"  R{i+1}: ${resistance['level']:.6f} (Strength: {resistance['total_strength']:.1f}, "
-                  f"Distance: {resistance['distance_pct']*100:.2f}%, Type: {resistance['type']})")
-        
-        print("\nPhase 2: Calculating Entry Strategy...")
-        entry_strategy = self.calculate_entry_strategy(sr_levels)
-        
-        if not entry_strategy['entry_valid']:
-            return {
-                "signal": "HOLD",
-                "reason": entry_strategy['reason'],
-                "sr_levels": sr_levels,
-                "timestamp": timestamp
-            }
-        
-        # Display entry strategy
-        print(f"\n🎯 Entry Strategy:")
-        print(f"  Support Level: ${entry_strategy['support_level']:.6f} ({entry_strategy['support_type']})")
-        print(f"  Entry Price: ${entry_strategy['entry_price']:.6f}")
-        print(f"  Stop Loss: ${entry_strategy['stop_loss']:.6f}")
-        print(f"  Risk: {entry_strategy['risk_pct']:.2f}%")
-        print(f"  Distance to Support: {entry_strategy['distance_to_support_pct']:.2f}%")
-        
-        if entry_strategy['targets']:
-            print(f"\n🎯 Targets:")
-            for target in entry_strategy['targets']:
-                print(f"  Target {target['target']}: ${target['price']:.6f} "
-                      f"(R:R {target['reward_risk_ratio']:.2f}, "
-                      f"Profit: {target['potential_profit_pct']:.1f}%)")
-        
-        # Perform traditional momentum analysis on 5m for confirmation
-        print("\nPhase 3: Momentum Confirmation...")
-        momentum_result = self.analyze_momentum_signals(df_5m)
-        
-        # Combine S/R analysis with momentum signals
-        combined_signal = self._combine_sr_momentum_signals(entry_strategy, momentum_result)
-        
-        result = {
-            "signal": combined_signal['signal'],
-            "confidence": combined_signal['confidence'],
-            "entry_strategy": entry_strategy,
-            "momentum_analysis": momentum_result,
-            "sr_levels": sr_levels,
-            "recommendation": entry_strategy['recommendation'],
-            "timestamp": timestamp
-        }
-        
-        return result
-    
-    def analyze_momentum_signals(self, df: pd.DataFrame) -> Dict:
-        """Analyze momentum signals (simplified version of original logic)."""
-        if len(df) < 21:
-            return {"momentum_score": 0, "momentum_signal": "INSUFFICIENT_DATA"}
-        
-        # Calculate indicators
-        df['ema_9'] = df['close'].ewm(span=9).mean()
-        df['ema_21'] = df['close'].ewm(span=21).mean()
-        df['rsi'] = self.calculate_rsi(df['close'])
-        
-        last_candle = df.iloc[-1]
-        
-        score = 0
-        
-        # EMA alignment
-        if last_candle['ema_9'] > last_candle['ema_21']:
-            score += 30
-        
-        # RSI check
-        if 40 <= last_candle['rsi'] <= 70:
-            score += 25
-        elif 30 <= last_candle['rsi'] <= 80:
-            score += 15
-        
-        # Price vs EMA
-        if last_candle['close'] > last_candle['ema_9']:
-            score += 20
-        
-        # Recent momentum
-        if df['close'].pct_change(3).iloc[-1] > 0:
-            score += 15
-        
-        momentum_signal = "BULLISH" if score >= 50 else "BEARISH" if score <= 30 else "NEUTRAL"
-        
-        return {
-            "momentum_score": score,
-            "momentum_signal": momentum_signal,
-            "ema_9": last_candle['ema_9'],
-            "ema_21": last_candle['ema_21'],
-            "rsi": last_candle['rsi']
-        }
-    
-    def calculate_rsi(self, data: pd.Series, period: int = 14) -> pd.Series:
-        """Calculate RSI."""
-        delta = data.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-    
-    def _combine_sr_momentum_signals(self, entry_strategy: Dict, momentum_result: Dict) -> Dict:
-        """Combine S/R analysis with momentum signals."""
-        base_confidence = 50  # Base confidence
-        
-        # S/R contribution (40% weight)
-        sr_score = 0
-        if entry_strategy['entry_valid']:
-            # Strong support adds confidence
-            sr_score += min(entry_strategy['support_strength'] * 5, 30)
-            
-            # Good risk/reward ratio adds confidence
-            if entry_strategy['targets']:
-                best_rr = max(t['reward_risk_ratio'] for t in entry_strategy['targets'])
-                sr_score += min(best_rr * 10, 10)
-        
-        # Momentum contribution (30% weight)
-        momentum_score = momentum_result['momentum_score'] * 0.3
-        
-        # Final confidence
-        total_confidence = base_confidence + sr_score + momentum_score
-        total_confidence = min(100, max(0, total_confidence))
-        
-        # Determine signal
-        if total_confidence >= 75 and momentum_result['momentum_signal'] == 'BULLISH':
-            signal = "STRONG_BUY"
-        elif total_confidence >= 60 and momentum_result['momentum_signal'] in ['BULLISH', 'NEUTRAL']:
-            signal = "BUY"
-        elif total_confidence >= 40:
-            signal = "WAIT"
-        else:
-            signal = "HOLD"
-        
-        return {
-            "signal": signal,
-            "confidence": total_confidence,
-            "sr_contribution": sr_score,
-            "momentum_contribution": momentum_score
-        }
-    
-    def run_enhanced_analysis(self):
-        """Run enhanced analysis with S/R levels."""
-        result = self.analyze_market_with_sr()
-        
-        if "error" in result:
-            print(f"Error: {result['error']}")
-            return result
-        
-        print(f"\n{'='*50}")
-        print(f"🚨 FINAL ENHANCED RESULT 🚨")
-        print(f"Signal: {result['signal']}")
-        print(f"Confidence: {result['confidence']:.1f}%")
-        print(f"Recommendation: {result['recommendation']}")
-        
-        if result['entry_strategy']['entry_valid']:
-            print(f"Entry Price: ${result['entry_strategy']['entry_price']:.6f}")
-            print(f"Stop Loss: ${result['entry_strategy']['stop_loss']:.6f}")
-            if result['entry_strategy']['targets']:
-                best_target = result['entry_strategy']['targets'][0]
-                print(f"Primary Target: ${best_target['price']:.6f} (R:R {best_target['reward_risk_ratio']:.2f})")
-        
-        print(f"{'='*50}")
-        
-        return result
 
+    # --- Logging Helpers ---
+    def _log_sr_levels(self, sr_levels):
+        print(f"  Current Price: ${sr_levels['current_price']:.4f}")
+        print("\n  Top Support Zones:")
+        for s in sr_levels['supports']:
+            conf_flag = ">> CONFLUENCE" if s['is_confluence'] else ""
+            print(f"    - Level: ${s['level']:.4f} (Strength: {s['strength']:.2f}) Methods: {s['methods']} {conf_flag}")
+        print("\n  Top Resistance Zones:")
+        for r in sr_levels['resistances']:
+            conf_flag = ">> CONFLUENCE" if r['is_confluence'] else ""
+            print(f"    - Level: ${r['level']:.4f} (Strength: {r['strength']:.2f}) Methods: {r['methods']} {conf_flag}")
+            
+    def _log_trade_setup(self, setup):
+        print(f"-> Valid Trade Setup Found:")
+        print(f"  - Reacting to Support: ${setup['primary_support']['level']:.4f} (Strength: {setup['primary_support']['strength']:.2f})")
+        print(f"  - Entry Price: ${setup['entry_price']:.4f}")
+        print(f"  - Stop Loss: ${setup['stop_loss']:.4f} (Risk: ${setup['risk_per_share']:.4f})")
+        for target in setup['targets'][:3]:
+            print(f"  - Target {target['target_num']}: ${target['price']:.4f} (R:R Ratio: {target['rr_ratio']})")
 
 def main():
     """Main function to run the enhanced bot."""
-    print("Enhanced Trading Bot with Support/Resistance Analysis")
+    print("Quantitative Trading Bot - Enhanced Signal Engine")
     print("=" * 60)
     
-    # Get trading pair from user
     if len(sys.argv) > 1:
         trading_pair = sys.argv[1]
     else:
@@ -667,17 +555,17 @@ def main():
     try:
         bot = EnhancedMomentumBot(trading_pair)
         
-        print(f"\nEnhanced Configuration:")
-        sr_config = {k: v for k, v in bot.config.items() if 'sr_' in k or 'fibonacci' in k or 'pivot' in k}
-        for key, value in sr_config.items():
+        print("\nRunning with Enhanced Configuration:")
+        for key, value in bot.config.items():
             print(f"  {key}: {value}")
-        
-        bot.run_enhanced_analysis()
+            
+        bot.analyze_market_with_sr()
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\nAn unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
