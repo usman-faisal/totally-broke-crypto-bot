@@ -727,7 +727,7 @@ class EnhancedMomentumBot:
         """
         if len(df) < 3:
             return {'pattern': 'UNKNOWN', 'strength': 0}
-            
+                
         recent_candles = df.tail(3)
         
         # Extract open, high, low, close values for the most recent candles
@@ -771,62 +771,62 @@ class EnhancedMomentumBot:
         
         # 2. Bullish Engulfing
         elif (c_close > c_open and  # Current candle is bullish
-              p_close < p_open and  # Previous candle is bearish
-              c_open < p_close and  # Current open below previous close
-              c_close > p_open and  # Current close above previous open
-              c_body_size > p_body_size * 0.8):  # Current body engulfs previous
+            p_close < p_open and  # Previous candle is bearish
+            c_open < p_close and  # Current open below previous close
+            c_close > p_open and  # Current close above previous open
+            c_body_size > p_body_size * 0.8):  # Current body engulfs previous
             
             pattern = 'BULLISH_ENGULFING'
             strength = 9
         
         # 3. Doji (near support)
         elif (c_body_size < c_total_size * 0.1 and  # Very small body
-              c_total_size > 0):  # Avoid division by zero
+            c_total_size > 0):  # Avoid division by zero
             
             pattern = 'DOJI'
             strength = 5
         
         # 4. Piercing Line
         elif (c_close > c_open and  # Current candle is bullish
-              p_close < p_open and  # Previous candle is bearish
-              c_open < p_close and  # Current open below previous close
-              c_close > (p_open + p_close) / 2):  # Closed above midpoint
+            p_close < p_open and  # Previous candle is bearish
+            c_open < p_close and  # Current open below previous close
+            c_close > (p_open + p_close) / 2):  # Closed above midpoint
             
             pattern = 'PIERCING_LINE'
             strength = 7
         
         # 5. Morning Star
         elif (len(recent_candles) >= 3 and
-              close_prices[-3] < open_prices[-3] and  # First candle bearish
-              abs(close_prices[-2] - open_prices[-2]) < p_body_size * 0.3 and  # Second candle small body
-              c_close > c_open and  # Third candle bullish
-              c_close > (open_prices[-3] + close_prices[-3]) / 2):  # Closed into first candle
+            close_prices[-3] < open_prices[-3] and  # First candle bearish
+            abs(close_prices[-2] - open_prices[-2]) < p_body_size * 0.3 and  # Second candle small body
+            c_close > c_open and  # Third candle bullish
+            c_close > (open_prices[-3] + close_prices[-3]) / 2):  # Closed into first candle
             
             pattern = 'MORNING_STAR'
             strength = 10
         
         # 6. Tweezer Bottom
         elif (p_close < p_open and  # Previous candle bearish
-              c_close > c_open and  # Current candle bullish
-              abs(p_low - c_low) < c_total_size * 0.1):  # Similar lows
+            c_close > c_open and  # Current candle bullish
+            abs(p_low - c_low) < c_total_size * 0.1):  # Similar lows
             
             pattern = 'TWEEZER_BOTTOM'
             strength = 6
         
         # 7. Three White Soldiers
         elif (len(recent_candles) >= 3 and
-              all(close_prices[-i] > open_prices[-i] for i in range(1, 4)) and  # 3 bullish candles
-              all(close_prices[-i] > close_prices[-i-1] for i in range(1, 3)) and  # Each closes higher
-              all(open_prices[-i] > open_prices[-i-1] for i in range(1, 3))):  # Each opens higher
+            all(close_prices[-i] > open_prices[-i] for i in range(1, min(4, len(close_prices) + 1))) and  # Bullish candles
+            all(i < len(close_prices)-1 and close_prices[-i] > close_prices[-i-1] for i in range(1, min(3, len(close_prices)))) and  # Each closes higher
+            all(i < len(open_prices)-1 and open_prices[-i] > open_prices[-i-1] for i in range(1, min(3, len(open_prices))))):  # Each opens higher
             
             pattern = 'THREE_WHITE_SOLDIERS'
             strength = 10
         
         # 8. Bullish Harami
         elif (p_close < p_open and  # Previous candle bearish
-              c_close > c_open and  # Current candle bullish
-              c_open > p_close and  # Current open above previous close
-              c_close < p_open):  # Current close below previous open
+            c_close > c_open and  # Current candle bullish
+            c_open > p_close and  # Current open above previous close
+            c_close < p_open):  # Current close below previous open
             
             pattern = 'BULLISH_HARAMI'
             strength = 6
@@ -838,8 +838,15 @@ class EnhancedMomentumBot:
             strength += 2
             
         # Trend confirmation (if this is a reversal of recent downtrend)
-        if all(close_prices[-i] < close_prices[-i-1] for i in range(2, min(6, len(df)))):
-            strength += 2
+        # FIXED: Make sure we don't go out of bounds
+        lookback = min(6, len(df))
+        if lookback > 2:  # Ensure we have at least 3 candles (current + 2 previous) for trend check
+            try:
+                if all(df['close'].iloc[-i] < df['close'].iloc[-i-1] for i in range(2, lookback)):
+                    strength += 2
+            except IndexError:
+                # Safely handle any unexpected index errors
+                pass
         
         return {
             'pattern': pattern,
