@@ -31,35 +31,39 @@ class EnhancedMomentumBot:
         self.exchange_name = exchange_name
         
         # Configuration parameters
+        # In the __init__ method
         self.config = {
-            'trend_tolerance': 0.02,
-            'strong_buy_threshold': 80,  # Increased threshold for STRONG_BUY
-            'buy_threshold': 65,         # Increased threshold for BUY
-            'pullback_tolerance': 0.005,
+            # General Parameters
+            'trend_tolerance': 0.02, # Kept the same
+            'strong_buy_threshold': 80,
+            'buy_threshold': 65,
+            'volume_confirmation': True,
+
+            # --- SCALPING S/R PARAMETERS ---
+            'sr_lookback_periods': 75,          # Reduced lookback for faster analysis on 5m chart
+            'sr_min_touches': 2,
+            'sr_proximity_threshold': 0.005,    # Initial threshold, but will be made dynamic
+            'fibonacci_enabled': False,         # DISABLED: Fibonacci is too noisy on low timeframes
+            'pivot_order': 3,                   # Reduced order for more sensitive peak detection
+            'sr_strength_threshold': 2,         # REDUCED: S/R levels on 5m are naturally weaker
+            'entry_buffer': 0.0005,             # REDUCED: 0.05% buffer for a tight entry
+            
+            # --- SCALPING RISK & STRATEGY PARAMETERS ---
+            'min_pullback_pct': 0.0015,         # REDUCED: Wait for a smaller 0.15% pullback
+            'atr_period': 10,                   # Reduced ATR period for more reactivity
+            'atr_stop_multiplier': 1.5,         # TIGHTER STOP: Use a smaller ATR multiplier for stops
+            'min_reward_risk_ratio': 1.2,       # REDUCED: A 1.2 R:R is more realistic for scalping
+            
+            # Unchanged Parameters
+            'crossover_lookback': 5,
             'rsi_threshold_high': 70,
             'rsi_threshold_low': 30,
-            'crossover_lookback': 5,
-            'volume_confirmation': True,
-            
-            # Support/Resistance parameters
-            'sr_lookback_periods': 100,     # Increased lookback for better S/R detection
-            'sr_min_touches': 2,            # Minimum touches to confirm S/R
-            'sr_proximity_threshold': 0.01, # Initial proximity threshold (will be made dynamic)
-            'fibonacci_enabled': True,      # Enable Fibonacci retracements
-            'pivot_order': 5,               # Order for scipy peak detection
-            'sr_strength_threshold': 3,     # Minimum strength for valid S/R
-            'entry_buffer': 0.002,          # 0.2% buffer above support for entry
-            
-            # Enhanced parameters for improved strategy
-            'atr_period': 14,                  # Period for ATR calculation
-            'atr_stop_multiplier': 2.0,        # ATR multiplier for stop loss
-            'min_reward_risk_ratio': 1.5,      # Minimum reward:risk ratio for valid setup
-            'confluence_boost_factor': 2.5,    # Multiplier for confluence zones
-            'time_decay_factor': 0.95,         # Exponential decay for older touches
-            'candlestick_confirmation': True,  # Require candlestick confirmation
-            'higher_tf_trend_filter': True,    # Enable higher timeframe trend filter
-            'divergence_confirmation': True,   # Enable divergence confirmation
-            'min_confluence_distance': 0.002,  # 0.2% threshold for confluence detection
+            'confluence_boost_factor': 2.5,
+            'time_decay_factor': 0.95,
+            'candlestick_confirmation': True,
+            'higher_tf_trend_filter': True,
+            'divergence_confirmation': True,
+            'min_confluence_distance': 0.001,   # REDUCED: 0.1% threshold for confluence
         }
         
         try:
@@ -871,11 +875,12 @@ class EnhancedMomentumBot:
             }
         
         # Find the strongest nearby support
+        min_pullback = self.config['min_pullback_pct']
         valid_supports = []
         for support in supports:
-            # Look for support within reasonable distance (max 5% below current price)
-            # Prioritize confluence zones
-            if support['distance_pct'] <= 0.05:
+            # Look for support within a reasonable range (e.g., 0.5% to 7% below current price)
+            # This filters out supports the price is already sitting on.
+            if min_pullback <= support['distance_pct'] <= 0.07:
                 valid_supports.append(support)
         
         if not valid_supports:
@@ -989,7 +994,9 @@ class EnhancedMomentumBot:
             'htf_trend': htf_trend['trend'],
             'setup_quality': setup_quality,
             'recommendation': self._generate_advanced_recommendation(
-                current_price, entry_price, targets, setup_quality, divergence_result, candlestick_result, htf_trend
+                current_price, entry_price, targets, setup_quality, 
+                divergence_result, candlestick_result, htf_trend,
+                {'support_level': support_level} # Pass the support level here
             )
         }
     
@@ -1000,7 +1007,9 @@ class EnhancedMomentumBot:
                                        setup_quality: Dict,
                                        divergence_result: Dict,
                                        candlestick_result: Dict,
-                                       htf_trend: Dict) -> str:
+                                       htf_trend: Dict,
+                                       entry_strategy: Dict
+                                       ) -> str:
         """Generate detailed entry recommendation based on advanced analysis."""
         price_diff_pct = ((current_price - entry_price) / entry_price) * 100
         
@@ -1014,67 +1023,57 @@ class EnhancedMomentumBot:
         # Get best target by reward:risk
         best_target = max(targets, key=lambda x: x['reward_risk_ratio']) if targets else None
         min_rr = self.config['min_reward_risk_ratio']
-        
-        # Build recommendation based on setup quality
-        if setup_quality['high_probability']:
-            if price_diff_pct > 1.5:
-                signal = "BUY"
-                reasons.append(f"Price {price_diff_pct:.1f}% above entry. Wait for better price.")
-            elif price_diff_pct > -0.5:
-                signal = "STRONG_BUY"
-                reasons.append("Price at ideal entry zone")
-            else:
-                signal = "STRONG_BUY"
-                reasons.append("Price below optimal entry - excellent opportunity")
-                
-            # Add setup quality reasons
+        support_level = entry_strategy['support_level']
+
+        def get_confirmation_reasons():
+            """Helper function to gather positive signals."""
+            conf_reasons = []
             if setup_quality['htf_trend_aligned']:
-                reasons.append(f"Higher timeframe trend confirms ({htf_trend['trend']})")
-            
+                conf_reasons.append(f"HTF trend confirms ({htf_trend['trend']})")
             if setup_quality['is_confluence_support']:
-                reasons.append("Multi-method confluence support zone")
-                
+                conf_reasons.append("Multi-method confluence support")
             if setup_quality['has_bullish_divergence']:
                 div_type = divergence_result.get('type', 'regular')
-                reasons.append(f"{div_type.capitalize()} bullish divergence detected")
-                
+                conf_reasons.append(f"{div_type.capitalize()} bullish divergence")
             if setup_quality['has_candlestick_confirmation']:
-                reasons.append(f"{candlestick_result['pattern']} pattern detected")
-                
+                conf_reasons.append(f"{candlestick_result['pattern']} pattern")
             if best_target and best_target['reward_risk_ratio'] >= min_rr:
-                reasons.append(f"Favorable R:R ratio {best_target['reward_risk_ratio']:.2f}")
-                
-        elif setup_quality['htf_trend_aligned'] and best_target and best_target['reward_risk_ratio'] >= min_rr:
-            # Good but not high-probability setup
-            if price_diff_pct > 1:
+                conf_reasons.append(f"Favorable R:R ({best_target['reward_risk_ratio']:.2f})")
+            return conf_reasons
+
+        if setup_quality['high_probability']:
+            reasons = get_confirmation_reasons()
+            if current_price > entry_price:
                 signal = "WAIT"
-                reasons.append(f"Wait for pullback to support")
+                reasons.insert(0, f"Wait for price to pull back to the entry zone near ${entry_price:.6f}")
+            elif current_price >= support_level:
+                signal = "STRONG_BUY"
+                reasons.insert(0, "Price has entered the ideal buy zone")
             else:
+                signal = "HOLD"
+                reasons.insert(0, f"Price is below support of ${support_level:.6f}. Awaiting reclaim.")
+
+        elif setup_quality.get('score', 0) >= 50 and setup_quality['htf_trend_aligned']:
+            reasons = get_confirmation_reasons()
+            if current_price > entry_price:
+                signal = "MONITOR"
+                reasons.insert(0, f"Decent setup. Monitor for a pullback to entry near ${entry_price:.6f}")
+            elif current_price >= support_level:
                 signal = "BUY"
-                reasons.append("Reasonable setup with trend alignment")
-            
-            if setup_quality['is_confluence_support']:
-                reasons.append("Support zone with confluence")
+                reasons.insert(0, "Price has entered entry zone for a moderate-conviction setup")
+            else:
+                signal = "HOLD"
+                reasons.insert(0, "Price has fallen below support.")
                 
-            if setup_quality['has_candlestick_confirmation'] or setup_quality['has_bullish_divergence']:
-                reasons.append("Has technical confirmation")
-                
-        elif setup_quality['htf_trend_aligned']:
-            signal = "MONITOR"
-            reasons.append("Aligned with higher timeframe trend")
-            reasons.append("Wait for additional confirmation signals")
-            
         else:
             signal = "HOLD"
-            
             if not setup_quality['htf_trend_aligned']:
                 reasons.append(f"Counter-trend setup ({htf_trend['trend']})")
-            
             if best_target and best_target['reward_risk_ratio'] < min_rr:
-                reasons.append(f"Poor R:R ratio {best_target['reward_risk_ratio']:.2f} < {min_rr}")
-                
-            reasons.append("Insufficient confirmation signals")
-            
+                reasons.append(f"Poor R:R ({best_target['reward_risk_ratio']:.2f})")
+            if not reasons:
+                reasons.append("Insufficient confirmation signals for a trade.")
+
         return f"{signal} - {'; '.join(reasons)}"
     
     def analyze_market_with_sr(self) -> Dict:
@@ -1088,15 +1087,15 @@ class EnhancedMomentumBot:
         print(f"{'='*70}")
         
         # Fetch data for various timeframes
-        df_1h = self.fetch_ohlcv_data('1h', limit=150)  # Increased for better S/R analysis
-        df_5m = self.fetch_ohlcv_data('5m', limit=200)  # For short-term signals
+        df_5m_structure = self.fetch_ohlcv_data('5m', limit=150)  # Use 5m for S/R structure
+        df_1m_entry = self.fetch_ohlcv_data('1m', limit=200)      # Use 1m for entry signals
         
-        if df_1h.empty or df_5m.empty:
+        if df_5m_structure.empty or df_1m_entry.empty:
             return {"error": "Insufficient data for analysis"}
         
         print("Phase 1: Analyzing Higher Timeframe Trend...")
         # Check higher timeframe trend (4h) for filtering
-        htf_trend = self.detect_higher_timeframe_trend('4h')
+        htf_trend = self.detect_higher_timeframe_trend('15m')
         
         print(f"  Higher Timeframe Trend: {htf_trend['trend']}")
         print(f"  Reason: {htf_trend.get('reason', 'Not available')}")
@@ -1104,7 +1103,7 @@ class EnhancedMomentumBot:
         print("\nPhase 2: Calculating Enhanced Support/Resistance Levels...")
         
         # Calculate S/R levels on 1h timeframe for better reliability
-        sr_levels = self.calculate_support_resistance_levels(df_1h)
+        sr_levels = self.calculate_support_resistance_levels(df_5m_structure)
         
         # Display S/R levels
         print(f"\n📊 Support Levels Found:")
@@ -1124,7 +1123,7 @@ class EnhancedMomentumBot:
                   f"Confluence: {confluence} Methods: {methods})")
         
         print("\nPhase 3: Calculating Advanced Entry Strategy...")
-        entry_strategy = self.calculate_entry_strategy(sr_levels, df_5m, htf_trend)
+        entry_strategy = self.calculate_entry_strategy(sr_levels, df_1m_entry, htf_trend)
         
         if not entry_strategy['entry_valid']:
             print(f"⚠️ No valid entry: {entry_strategy.get('reason', 'Unknown reason')}")
@@ -1185,7 +1184,7 @@ class EnhancedMomentumBot:
         
         # Perform traditional momentum analysis on 5m for confirmation
         print("\nPhase 4: Momentum Confirmation Analysis...")
-        momentum_result = self.analyze_momentum_signals(df_5m)
+        momentum_result = self.analyze_momentum_signals(df_1m_entry)
         print(f"  Momentum Signal: {momentum_result['momentum_signal']}")
         print(f"  Momentum Score: {momentum_result['momentum_score']}/100")
         print(f"  RSI: {momentum_result['rsi']:.1f}")
